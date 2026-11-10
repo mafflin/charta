@@ -14,7 +14,7 @@ struct Env {
 impl Env {
     fn new() -> Self {
         let env = Self::bare();
-        env.write_config("autosync = false\n");
+        env.write_config("autosync = \"off\"\n");
         git(&["init", "-q"], &env.notes());
         env
     }
@@ -244,7 +244,7 @@ fn init_local_only_via_prompts() {
         .success();
     assert!(env.notes().join(".git").exists());
     let config = fs::read_to_string(env.path("config/charta/settings.toml")).unwrap();
-    assert!(config.contains("autosync = false"), "{config}");
+    assert!(config.contains("autosync = \"off\""), "{config}");
     assert!(!config.contains("repo"), "{config}");
 }
 
@@ -271,7 +271,7 @@ fn autosync_clones_pushes_and_pulls() {
         env.root.path(),
     );
     let notes = env.notes().display().to_string();
-    let answers = format!("{notes}\n{}\n\n", remote.display());
+    let answers = format!("{notes}\n{}\nfull\n", remote.display());
     env.cmd(None)
         .arg("init")
         .write_stdin(answers)
@@ -317,7 +317,7 @@ fn autosync_clones_pushes_and_pulls() {
 #[test]
 fn autosync_offline_still_saves_locally() {
     let env = Env::new();
-    env.write_config("autosync = true\n");
+    env.write_config("repo = \"/nonexistent/remote.git\"\nautosync = \"full\"\n");
     git(
         &["remote", "add", "origin", "/nonexistent/remote.git"],
         &env.notes(),
@@ -357,7 +357,7 @@ fn bash_completion_completes_commands_and_note_names() {
         );
         String::from_utf8(out.stdout).unwrap()
     };
-    assert_eq!(complete("charta ''"), "init\nnew\nopen\nlist\nhelp\n");
+    assert_eq!(complete("charta ''"), "init\nnew\nopen\nlist\nsync\nhelp\n");
     assert_eq!(complete("charta o"), "open\n");
     assert_eq!(complete("charta open ''"), "todo\nwork/standup\n");
     assert_eq!(complete("charta open w"), "work/standup\n");
@@ -413,7 +413,10 @@ fn zsh_completion_completes_commands_and_note_names() {
         );
         String::from_utf8(out.stdout).unwrap()
     };
-    assert_eq!(complete(&["charta", ""]), "init\nnew\nopen\nlist\nhelp\n");
+    assert_eq!(
+        complete(&["charta", ""]),
+        "init\nnew\nopen\nlist\nsync\nhelp\n"
+    );
     assert_eq!(complete(&["charta", "open", ""]), "todo\nwork/standup\n");
     assert_eq!(complete(&["charta", "new", ""]), "");
 }
@@ -440,7 +443,8 @@ fn push_from_elsewhere(env: &Env, remote: &Path, file: &str, content: &str) {
     git(&["push", "-q", "origin", "HEAD"], &other);
 }
 
-/// Runs `charta init` keeping the notes dir and setting `remote` with autosync.
+/// Runs `charta init` keeping the notes dir and setting `remote` with the
+/// default autosync (`save`).
 fn init_with_remote(env: &Env, remote: &Path) {
     env.cmd(None)
         .arg("init")
@@ -486,7 +490,7 @@ fn pull_conflict_aborts_rebase_and_keeps_local_note() {
 #[test]
 fn init_dash_switches_back_to_local_only() {
     let env = Env::new();
-    env.write_config("repo = \"git@example.com:me/notes.git\"\nautosync = true\n");
+    env.write_config("repo = \"git@example.com:me/notes.git\"\nautosync = \"full\"\n");
     env.cmd(None)
         .arg("init")
         .write_stdin("\n-\n")
@@ -494,7 +498,7 @@ fn init_dash_switches_back_to_local_only() {
         .success();
     let config = fs::read_to_string(env.path("config/charta/settings.toml")).unwrap();
     assert!(!config.contains("repo"), "{config}");
-    assert!(config.contains("autosync = false"), "{config}");
+    assert!(config.contains("autosync = \"off\""), "{config}");
 }
 
 #[test]
@@ -609,7 +613,7 @@ fn init_recovers_from_broken_settings() {
         .success()
         .stderr(predicate::str::contains("starting from defaults"));
     assert!(
-        settings(&env).contains("autosync = false"),
+        settings(&env).contains("autosync = \"off\""),
         "{}",
         settings(&env)
     );
@@ -805,4 +809,325 @@ fn reports_editor_error_when_commit_also_fails() {
             predicate::str::contains("failed to launch editor")
                 .and(predicate::str::contains("committing it failed")),
         );
+}
+
+/// Runs `charta init` with the notes dir, `remote`, and autosync off.
+fn init_without_autosync(env: &Env, remote: &Path) {
+    env.cmd(None)
+        .arg("init")
+        .write_stdin(format!(
+            "{}\n{}\noff\n",
+            env.notes().display(),
+            remote.display()
+        ))
+        .assert()
+        .success();
+}
+
+fn commit_count(repo: &Path) -> String {
+    git_out(&["rev-list", "--all", "--count"], repo)
+}
+
+#[test]
+fn sync_pulls_and_pushes_without_autosync() {
+    let env = Env::bare();
+    let remote = bare_remote(&env);
+    init_without_autosync(&env, &remote);
+    assert!(settings(&env).contains("autosync = \"off\""));
+
+    // Without autosync, nothing reaches the remote on its own.
+    env.cmd(Some("mine")).args(["new", "a"]).assert().success();
+    assert_eq!(commit_count(&remote), "0\n");
+
+    // The remote got history elsewhere; sync starts tracking it, then pushes.
+    push_from_elsewhere(&env, &remote, "b.md", "theirs");
+    env.cmd(None).arg("sync").assert().success();
+    assert_eq!(
+        fs::read_to_string(env.notes().join("b.md")).unwrap(),
+        "theirs"
+    );
+    assert_eq!(
+        git_out(&["log", "--format=%s", "HEAD"], &remote),
+        "a: create\nb.md\n"
+    );
+
+    // Once tracking, sync pushes new local commits.
+    env.cmd(Some("more")).args(["new", "c"]).assert().success();
+    env.cmd(None).arg("sync").assert().success();
+    assert_eq!(
+        git_out(&["log", "--format=%s", "-1", "HEAD"], &remote),
+        "c: create\n"
+    );
+}
+
+#[test]
+fn sync_fails_when_offline_and_keeps_local_commits() {
+    let env = Env::bare();
+    let remote = bare_remote(&env);
+    init_without_autosync(&env, &remote);
+    env.cmd(Some("v1")).args(["new", "a"]).assert().success();
+    env.cmd(None).arg("sync").assert().success();
+
+    fs::rename(&remote, env.path("gone.git")).unwrap();
+    env.cmd(Some("v2")).args(["open", "a"]).assert().success();
+    // A plain network failure is no conflict to resolve.
+    env.cmd(None)
+        .arg("sync")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("resolve manually").not());
+    assert_eq!(env.log(), "a: update\na: create\n");
+}
+
+#[test]
+fn sync_without_setup_fails_instead_of_prompting() {
+    let env = Env::bare();
+    env.cmd(None)
+        .arg("sync")
+        .write_stdin("\n\n")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("not set up"));
+    assert!(!env.path("config/charta/settings.toml").exists());
+}
+
+#[test]
+fn save_autosync_retries_failed_push_without_a_change() {
+    let env = Env::bare();
+    let remote = bare_remote(&env);
+    init_with_remote(&env, &remote);
+    env.cmd(Some("v1")).args(["new", "a"]).assert().success();
+
+    let gone = env.path("gone.git");
+    fs::rename(&remote, &gone).unwrap();
+    env.cmd(Some("v2"))
+        .args(["open", "a"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("committed locally"));
+    fs::rename(&gone, &remote).unwrap();
+
+    env.cmd(Some("v2")).args(["open", "a"]).assert().success();
+    assert_eq!(
+        git_out(&["log", "--format=%s", "HEAD"], &remote),
+        "a: update\na: create\n"
+    );
+}
+
+#[test]
+fn sync_conflict_fails_and_aborts_rebase() {
+    let env = Env::bare();
+    let remote = bare_remote(&env);
+    init_without_autosync(&env, &remote);
+    env.cmd(Some("base")).args(["new", "a"]).assert().success();
+    env.cmd(None).arg("sync").assert().success();
+    push_from_elsewhere(&env, &remote, "a.md", "theirs");
+    env.cmd(Some("mine")).args(["open", "a"]).assert().success();
+
+    env.cmd(None)
+        .arg("sync")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("resolve manually"));
+
+    let git_dir = env.notes().join(".git");
+    assert!(!git_dir.join("rebase-merge").exists() && !git_dir.join("rebase-apply").exists());
+    assert_eq!(
+        fs::read_to_string(env.notes().join("a.md")).unwrap(),
+        "mine"
+    );
+    assert_eq!(commit_count(&remote), "2\n");
+}
+
+#[test]
+fn sync_fails_for_local_only_notes_despite_leftover_remote() {
+    let env = Env::new();
+    let remote = bare_remote(&env);
+    git(
+        &["remote", "add", "origin", remote.to_str().unwrap()],
+        &env.notes(),
+    );
+    env.cmd(None)
+        .arg("sync")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("local-only"));
+}
+
+#[test]
+fn local_only_notes_never_autosync_despite_leftover_remote() {
+    let env = Env::new();
+    let remote = bare_remote(&env);
+    git(
+        &["remote", "add", "origin", remote.to_str().unwrap()],
+        &env.notes(),
+    );
+    for mode in ["full", "save"] {
+        env.write_config(&format!("autosync = \"{mode}\"\n"));
+        env.cmd(Some(mode))
+            .args(["new", mode])
+            .assert()
+            .success()
+            .stderr(predicate::str::is_empty());
+    }
+    assert_eq!(commit_count(&remote), "0\n");
+}
+
+#[test]
+fn sync_fails_when_repo_has_no_remote() {
+    let env = Env::new();
+    env.write_config("repo = \"/somewhere/notes.git\"\n");
+    env.cmd(None)
+        .arg("sync")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("has no remote"));
+}
+
+#[test]
+fn sync_brings_remote_history_into_clone_without_commits() {
+    let env = Env::bare();
+    let remote = bare_remote(&env);
+    init_without_autosync(&env, &remote); // clones the still empty remote
+    push_from_elsewhere(&env, &remote, "theirs.md", "remote");
+
+    env.cmd(None).arg("sync").assert().success();
+    assert_eq!(
+        fs::read_to_string(env.notes().join("theirs.md")).unwrap(),
+        "remote"
+    );
+    assert_eq!(env.log(), "theirs.md\n");
+}
+
+#[test]
+fn sync_refuses_to_pull_over_uncommitted_changes() {
+    let env = Env::bare();
+    let remote = bare_remote(&env);
+    init_without_autosync(&env, &remote);
+    env.cmd(Some("v1")).args(["new", "a"]).assert().success();
+    env.cmd(None).arg("sync").assert().success();
+    push_from_elsewhere(&env, &remote, "b.md", "theirs");
+    // Edited outside charta, never committed.
+    fs::write(env.notes().join("a.md"), "uncommitted").unwrap();
+
+    env.cmd(None)
+        .arg("sync")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("uncommitted changes"));
+    assert_eq!(
+        fs::read_to_string(env.notes().join("a.md")).unwrap(),
+        "uncommitted"
+    );
+    assert!(!env.notes().join("b.md").exists());
+    assert_eq!(env.log(), "a: create\n");
+}
+
+#[test]
+fn full_autosync_pushes_after_a_change_without_pulling_again() {
+    let env = Env::bare();
+    let remote = bare_remote(&env);
+    env.cmd(None)
+        .arg("init")
+        .write_stdin(format!(
+            "{}\n{}\nfull\n",
+            env.notes().display(),
+            remote.display()
+        ))
+        .assert()
+        .success();
+    // The editor pushes a note elsewhere while charta waits for it, so a
+    // pull after saving would bring it in.
+    let other = env.path("other");
+    let editor = format!(
+        "sh -c 'printf mine > \"$1\" && cd {other:?} && printf theirs > b.md && \
+         git add b.md && git commit -qm b && git push -q origin HEAD' editor",
+    );
+    let other_str = other.to_str().unwrap();
+    git(
+        &["clone", "-q", remote.to_str().unwrap(), other_str],
+        env.root.path(),
+    );
+    env.cmd(None)
+        .env("EDITOR", editor)
+        .args(["new", "a"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("committed locally"));
+    // The push was rejected (the remote moved on), and nothing was pulled.
+    assert!(!env.notes().join("b.md").exists());
+    assert_eq!(env.log(), "a: create\n");
+}
+
+#[test]
+fn save_autosync_syncs_only_after_a_change() {
+    let env = Env::bare();
+    let remote = bare_remote(&env);
+    env.cmd(None)
+        .arg("init")
+        .write_stdin(format!(
+            "{}\n{}\n\n",
+            env.notes().display(),
+            remote.display()
+        ))
+        .assert()
+        .success();
+    assert!(settings(&env).contains("autosync = \"save\""));
+
+    env.cmd(Some("v1")).args(["new", "a"]).assert().success();
+    assert_eq!(
+        git_out(&["log", "--format=%s", "HEAD"], &remote),
+        "a: create\n"
+    );
+
+    // No change, no network: the remote's new note isn't pulled.
+    push_from_elsewhere(&env, &remote, "b.md", "theirs");
+    env.cmd(Some("v1")).args(["open", "a"]).assert().success();
+    assert!(!env.notes().join("b.md").exists());
+
+    // A change is rebased onto the remote and pushed.
+    env.cmd(Some("v2")).args(["open", "a"]).assert().success();
+    assert!(env.notes().join("b.md").exists());
+    assert_eq!(
+        git_out(&["log", "--format=%s", "HEAD"], &remote),
+        "a: update\nb.md\na: create\n"
+    );
+}
+
+#[test]
+fn save_autosync_offline_warns_once_and_saves_locally() {
+    let env = Env::new();
+    env.write_config("repo = \"/nonexistent/remote.git\"\nautosync = \"save\"\n");
+    git(
+        &["remote", "add", "origin", "/nonexistent/remote.git"],
+        &env.notes(),
+    );
+    let out = env
+        .cmd(Some("offline"))
+        .args(["new", "x"])
+        .assert()
+        .success()
+        .get_output()
+        .stderr
+        .clone();
+    let stderr = String::from_utf8(out).unwrap();
+    assert_eq!(stderr.matches("warning").count(), 1, "{stderr}");
+    assert_eq!(env.log(), "x: create\n");
+}
+
+#[test]
+fn init_reprompts_on_unknown_autosync_mode() {
+    let env = Env::bare();
+    let remote = bare_remote(&env);
+    env.cmd(None)
+        .arg("init")
+        .write_stdin(format!(
+            "{}\n{}\nFull\nfull\n",
+            env.notes().display(),
+            remote.display()
+        ))
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("Please answer full, save, off."));
+    assert!(settings(&env).contains("autosync = \"full\""));
 }

@@ -6,13 +6,13 @@ mod init;
 mod notes;
 
 use std::env;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
 
 use cli::{Cli, Command};
-use config::{APP_NAME, Config};
+use config::{APP_NAME, Autosync, Config};
 
 fn main() {
     if let Err(err) = run() {
@@ -55,18 +55,30 @@ fn run() -> Result<()> {
         }
         Some(Command::List) => {
             // No pull here: this runs on every tab completion.
-            let config = Config::load()?
-                .with_context(|| format!("{APP_NAME} is not set up, run `{APP_NAME} init`"))?;
+            let config = load_existing()?;
             for name in notes::list(&config.notes_path()?)? {
                 println!("{name}");
             }
             Ok(())
         }
+        Some(Command::Sync) => {
+            // No interactive setup here: this may run unattended.
+            let config = load_existing()?;
+            if config.is_local_only() {
+                bail!("notes are local-only, set a remote with `{APP_NAME} init`");
+            }
+            let dir = repo_dir(&config)?;
+            if !git::has_remote(&dir) {
+                bail!("the notes repo has no remote, run `{APP_NAME} init`");
+            }
+            git::sync(&dir)
+        }
     }
 }
 
-/// Loads the config (running `init` if there is none) and syncs if enabled.
-fn setup() -> Result<(Config, std::path::PathBuf)> {
+/// Loads the config (running `init` if there is none), finds the notes repo
+/// and, with `full` autosync, pulls.
+fn setup() -> Result<(Config, PathBuf)> {
     let config = match Config::load()? {
         Some(config) => config,
         None => {
@@ -74,6 +86,19 @@ fn setup() -> Result<(Config, std::path::PathBuf)> {
             init::run(None)?
         }
     };
+    let dir = repo_dir(&config)?;
+    if config.sync_mode() == Autosync::Full {
+        git::pull(&dir);
+    }
+    Ok((config, dir))
+}
+
+fn load_existing() -> Result<Config> {
+    Config::load()?.with_context(|| format!("{APP_NAME} is not set up, run `{APP_NAME} init`"))
+}
+
+/// The notes directory, checked to be a git repo.
+fn repo_dir(config: &Config) -> Result<PathBuf> {
     let dir = config.notes_path()?;
     if !git::is_repo(&dir) {
         bail!(
@@ -81,14 +106,11 @@ fn setup() -> Result<(Config, std::path::PathBuf)> {
             dir.display()
         );
     }
-    if config.autosync {
-        git::pull(&dir);
-    }
-    Ok((config, dir))
+    Ok(dir)
 }
 
 /// Opens a note in the editor, deletes it if left empty, then commits
-/// (and pushes, with autosync) whatever changed.
+/// whatever changed and, with autosync, gets it to the remote.
 fn edit(config: &Config, dir: &Path, name: &str) -> Result<()> {
     let path = notes::path(dir, name);
     if let Some(parent) = path.parent() {
@@ -112,8 +134,13 @@ fn edit(config: &Config, dir: &Path, name: &str) -> Result<()> {
     if committed && !path.exists() {
         eprintln!("{APP_NAME}: deleted empty note `{name}`");
     }
-    if config.autosync {
-        git::push(dir);
+    match config.sync_mode() {
+        Autosync::Off => {}
+        // Already pulled before editing.
+        Autosync::Full => git::push(dir),
+        Autosync::Save if committed => git::sync_or_warn(dir),
+        // Nothing changed: just retry a push that failed earlier, if any.
+        Autosync::Save => git::push(dir),
     }
     edited
 }

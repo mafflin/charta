@@ -10,6 +10,8 @@ pub const GIT_DIR: &str = ".git";
 pub const DEFAULT_REMOTE: &str = "origin";
 const UPSTREAM_REF: &str = "@{upstream}";
 const HEAD: &str = "HEAD";
+const COMMITTED_LOCALLY: &str = "changes are committed locally";
+const KEEPING_LOCAL: &str = "continuing with local notes";
 
 /// What happened to a note, as recorded in its commit message.
 enum NoteChange {
@@ -81,8 +83,11 @@ fn describe(cmd: &Command) -> String {
     format!("{GIT} {}", args.join(" "))
 }
 
-fn warn(err: anyhow::Error, consequence: &str) {
-    eprintln!("{APP_NAME}: warning: {err:#}, {consequence}");
+/// Reports a failed sync step as a warning, with what it means for the notes.
+fn warn_on_err(result: Result<()>, consequence: &str) {
+    if let Err(err) = result {
+        eprintln!("{APP_NAME}: warning: {err:#}, {consequence}");
+    }
 }
 
 pub fn is_repo(dir: &Path) -> bool {
@@ -107,6 +112,10 @@ pub fn init(dir: &Path) -> Result<()> {
 
 fn remote_url(dir: &Path) -> Option<String> {
     output(git(dir).args(["remote", "get-url", DEFAULT_REMOTE])).ok()
+}
+
+pub fn has_remote(dir: &Path) -> bool {
+    remote_url(dir).is_some()
 }
 
 fn has_commits(dir: &Path) -> bool {
@@ -141,14 +150,15 @@ pub fn connect_remote(dir: &Path, url: &str) -> Result<()> {
     }
     // Pruning drops refs of a previous remote, so they don't count as upstream.
     fetch(dir)?;
-    track(dir)
+    track(dir)?;
+    warn_on_err(integrate(dir), KEEPING_LOCAL);
+    Ok(())
 }
 
 /// If there's no upstream yet and the (already fetched) remote has history,
 /// tracks it: the remote branch of the same name if there is one, otherwise
-/// the remote's default branch, renaming the local branch to match. Then
-/// integrates it. Does nothing for an empty remote; the first push sets the
-/// upstream instead.
+/// the remote's default branch, renaming the local branch to match. Does
+/// nothing for an empty remote; the first push sets the upstream instead.
 fn track(dir: &Path) -> Result<()> {
     if has_upstream(dir) {
         return Ok(());
@@ -174,9 +184,7 @@ fn track(dir: &Path) -> Result<()> {
         run(git(dir).args(["branch", "-m", name]))?;
         remote_branch
     };
-    run(git(dir).args(["branch", "-q", "--set-upstream-to", &remote_branch]))?;
-    pull(dir);
-    Ok(())
+    run(git(dir).args(["branch", "-q", "--set-upstream-to", &remote_branch]))
 }
 
 /// The remote's default branch as `origin/<name>`, if the remote has one.
@@ -186,47 +194,88 @@ fn remote_default_branch(dir: &Path) -> Option<String> {
     output(git(dir).args(["symbolic-ref", "--short", &default_ref])).ok()
 }
 
-/// Pulls if the current branch tracks a remote. If there's a remote but no
-/// upstream yet (it was empty at `init`), checks whether it has history now.
-/// Failures are only warnings: being offline must never stop you from taking
-/// a note. A conflicting rebase is aborted so the repo is never left
-/// mid-rebase.
-pub fn pull(dir: &Path) {
-    if !has_upstream(dir) {
-        if remote_url(dir).is_some()
-            && let Err(err) = fetch(dir).and_then(|()| track(dir))
-        {
-            warn(err, "continuing with local notes");
-        }
-        return;
+/// Fetches the remote, starts tracking it if it has history now (it may have
+/// been empty at `init`), and rebases local commits onto it.
+fn try_pull(dir: &Path) -> Result<()> {
+    if !has_remote(dir) {
+        return Ok(());
     }
-    if let Err(err) = run(git(dir).args(["pull", "-q", "--rebase", "--autostash"])) {
-        succeeds(git(dir).args(["rebase", "--abort"]));
-        let consequence = format!(
-            "continuing with local notes (resolve manually in {})",
+    fetch(dir)?;
+    track(dir)?;
+    integrate(dir)
+}
+
+/// Brings the already fetched upstream into the current branch, without
+/// touching the network. Refuses to start with uncommitted changes, and
+/// aborts a conflicting rebase: either way the repo is left as it was.
+fn integrate(dir: &Path) -> Result<()> {
+    if !has_upstream(dir) {
+        return Ok(());
+    }
+    if !has_commits(dir) {
+        // Nothing to rebase yet (and `rebase` can't start from no commits).
+        return run(git(dir).args(["merge", "-q", "--ff-only", UPSTREAM_REF]));
+    }
+    if has_uncommitted_changes(dir)? {
+        bail!(
+            "uncommitted changes in {}, commit or discard them first",
             dir.display()
         );
-        warn(err, &consequence);
     }
+    if let Err(err) = run(git(dir).args(["rebase", "-q", UPSTREAM_REF])) {
+        // Only succeeds if the rebase got as far as a conflict.
+        if succeeds(git(dir).args(["rebase", "--abort"])) {
+            bail!(
+                "{err:#}: local and remote changes conflict (resolve manually in {})",
+                dir.display()
+            );
+        }
+        return Err(err);
+    }
+    Ok(())
+}
+
+/// Whether tracked files differ from the last commit. Untracked files don't
+/// count: a rebase leaves them alone.
+fn has_uncommitted_changes(dir: &Path) -> Result<bool> {
+    let status = output(git(dir).args(["status", "--porcelain", "--untracked-files=no"]))?;
+    Ok(!status.is_empty())
+}
+
+/// [`try_pull`], with failures only as warnings: being offline must never
+/// stop you from taking a note.
+pub fn pull(dir: &Path) {
+    warn_on_err(try_pull(dir), KEEPING_LOCAL);
 }
 
 /// Pushes local commits the upstream doesn't have, setting the upstream to
-/// [`DEFAULT_REMOTE`] on first push. Failures are only warnings; commits stay
-/// local until the next successful push.
-pub fn push(dir: &Path) {
-    let result = if has_upstream(dir) {
-        if !is_ahead(dir) {
-            return;
+/// [`DEFAULT_REMOTE`] on first push.
+fn try_push(dir: &Path) -> Result<()> {
+    if has_upstream(dir) {
+        if is_ahead(dir) {
+            run(git(dir).args(["push", "-q"]))?;
         }
-        run(git(dir).args(["push", "-q"]))
-    } else if remote_url(dir).is_some() && has_commits(dir) {
-        run(git(dir).args(["push", "-q", "-u", DEFAULT_REMOTE, HEAD]))
-    } else {
-        return;
-    };
-    if let Err(err) = result {
-        warn(err, "changes are committed locally");
+    } else if has_remote(dir) && has_commits(dir) {
+        run(git(dir).args(["push", "-q", "-u", DEFAULT_REMOTE, HEAD]))?;
     }
+    Ok(())
+}
+
+/// [`try_push`], with failures only as warnings; commits stay local until
+/// the next successful push.
+pub fn push(dir: &Path) {
+    warn_on_err(try_push(dir), COMMITTED_LOCALLY);
+}
+
+/// Pulls, then pushes local commits.
+pub fn sync(dir: &Path) -> Result<()> {
+    try_pull(dir)?;
+    try_push(dir)
+}
+
+/// [`sync`], with failures only as warnings.
+pub fn sync_or_warn(dir: &Path) {
+    warn_on_err(sync(dir), COMMITTED_LOCALLY);
 }
 
 /// Commits the current state of a single note, if it changed.

@@ -22,4 +22,6 @@ pub enum Command {
     Open { name: String },
     /// List all notes
     List,
+    /// Pull remote changes and push local commits
+    Sync,
 }

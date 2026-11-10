@@ -21,9 +21,9 @@ pub struct Config {
     /// Git remote URL of the notes repo. `None` means local-only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo: Option<String>,
-    /// Pull before every command, push after every edit.
+    /// When to sync with the remote.
     #[serde(default)]
-    pub autosync: bool,
+    pub autosync: Autosync,
     /// Directory holding the notes repo. May start with `~`.
     #[serde(default = "default_notes_dir")]
     pub notes_dir: String,
@@ -33,9 +33,43 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             repo: None,
-            autosync: false,
+            autosync: Autosync::default(),
             notes_dir: default_notes_dir(),
         }
+    }
+}
+
+/// When to sync with the remote. Use [`Config::sync_mode`] to read it: it's
+/// ignored for local-only notes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Autosync {
+    /// Pull before opening the editor, push after.
+    Full,
+    /// Pull and push after a change only, so the editor opens right away.
+    #[default]
+    Save,
+    /// Never; sync with `charta sync`.
+    Off,
+}
+
+impl Autosync {
+    pub const ALL: [Self; 3] = [Self::Full, Self::Save, Self::Off];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Save => "save",
+            Self::Off => "off",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|mode| mode.as_str() == name)
+    }
+
+    pub fn names() -> String {
+        Self::ALL.map(Self::as_str).join(", ")
     }
 }
 
@@ -62,6 +96,20 @@ impl Config {
         fs::write(&path, toml::to_string(self)?)
             .with_context(|| format!("failed to write {}", path.display()))?;
         Ok(path)
+    }
+
+    /// How the notes actually sync: local-only notes never do, whatever
+    /// `autosync` says.
+    pub fn sync_mode(&self) -> Autosync {
+        if self.is_local_only() {
+            Autosync::Off
+        } else {
+            self.autosync
+        }
+    }
+
+    pub fn is_local_only(&self) -> bool {
+        self.repo.is_none()
     }
 
     pub fn notes_path(&self) -> Result<PathBuf> {
@@ -115,7 +163,7 @@ mod tests {
     fn missing_fields_use_defaults() {
         let config: Config = toml::from_str("").unwrap();
         assert_eq!(config.repo, None);
-        assert!(!config.autosync);
+        assert_eq!(config.autosync, Autosync::Save);
         assert!(Path::new(&config.notes_dir).ends_with(Path::new(APP_NAME).join(NOTES_SUBDIR)));
     }
 
@@ -123,11 +171,47 @@ mod tests {
     fn roundtrip() {
         let config = Config {
             repo: Some("git@example.com:me/notes.git".into()),
-            autosync: true,
+            autosync: Autosync::Save,
             notes_dir: "~/notes".into(),
         };
         let text = toml::to_string(&config).unwrap();
         assert_eq!(toml::from_str::<Config>(&text).unwrap(), config);
+    }
+
+    #[test]
+    fn autosync_modes_roundtrip_as_strings() {
+        for mode in Autosync::ALL {
+            let config = Config {
+                autosync: mode,
+                ..Config::default()
+            };
+            let text = toml::to_string(&config).unwrap();
+            let line = format!("autosync = \"{}\"", mode.as_str());
+            assert!(text.contains(&line), "{text}");
+            assert_eq!(toml::from_str::<Config>(&text).unwrap().autosync, mode);
+        }
+    }
+
+    #[test]
+    fn autosync_rejects_unknown_modes() {
+        let err = toml::from_str::<Config>("autosync = \"sometimes\"").unwrap_err();
+        assert!(err.to_string().contains("full"), "{err}");
+        assert!(toml::from_str::<Config>("autosync = true").is_err());
+        assert!(toml::from_str::<Config>("autosync = \"Full\"").is_err());
+    }
+
+    #[test]
+    fn local_only_never_syncs() {
+        let local = Config {
+            autosync: Autosync::Full,
+            ..Config::default()
+        };
+        assert_eq!(local.sync_mode(), Autosync::Off);
+        let remote = Config {
+            repo: Some("git@example.com:me/notes.git".into()),
+            ..local
+        };
+        assert_eq!(remote.sync_mode(), Autosync::Full);
     }
 
     #[test]

@@ -7,6 +7,7 @@ commands=(
     'new:create a new note with the given name'
     'open:open an existing note'
     'list:list all notes'
+    'sync:pull remote changes and push local commits'
     'help:print help'
 )
 if (( CURRENT == 2 )); then

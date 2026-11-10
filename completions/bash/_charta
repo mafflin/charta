@@ -5,7 +5,7 @@ _charta() {
     local cur="${COMP_WORDS[COMP_CWORD]}"
     COMPREPLY=()
     if [[ $COMP_CWORD -eq 1 ]]; then
-        COMPREPLY=($(compgen -W "init new open list help" -- "$cur"))
+        COMPREPLY=($(compgen -W "init new open list sync help" -- "$cur"))
     elif [[ $COMP_CWORD -eq 2 ]]; then
         case "${COMP_WORDS[1]}" in
             open)
@@ -13,7 +13,7 @@ _charta() {
                 COMPREPLY=($(compgen -W "$(charta list 2>/dev/null)" -- "$cur"))
                 ;;
             help)
-                COMPREPLY=($(compgen -W "init new open list" -- "$cur"))
+                COMPREPLY=($(compgen -W "init new open list sync" -- "$cur"))
                 ;;
         esac
     fi

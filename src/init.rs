@@ -4,7 +4,7 @@ use std::io::{self, BufRead, Write};
 
 use anyhow::{Context, Result, bail};
 
-use crate::config::{self, APP_NAME, Config};
+use crate::config::{self, APP_NAME, Autosync, Config};
 use crate::git;
 
 /// Answer to the remote prompt that switches back to local-only notes.
@@ -24,11 +24,11 @@ pub fn run(existing: Option<Config>) -> Result<Config> {
     };
     let repo = Some(repo).filter(|r| !r.is_empty() && r != LOCAL_ONLY_ANSWER);
     let autosync = match repo {
-        Some(_) => confirm(
-            "Autosync (pull before commands, push after edits)?",
-            current.repo.is_none() || current.autosync,
-        )?,
-        None => false,
+        Some(_) => choose_autosync(match current.repo {
+            Some(_) => current.autosync,
+            None => Autosync::default(),
+        })?,
+        None => Autosync::Off,
     };
 
     // Fail before changing anything: a half-connected repo is worse than none.
@@ -59,7 +59,7 @@ fn absolutize(dir: &str) -> Result<String> {
 }
 
 /// Clones, creates, or reuses the notes repo. An existing repo is connected
-/// to the remote; further syncing is left to the next command.
+/// to the remote with [`git::connect_remote`].
 fn prepare_repo(config: &Config) -> Result<()> {
     let dir = config.notes_path()?;
     if git::is_repo(&dir) {
@@ -106,17 +106,15 @@ fn prompt(question: &str, default: &str) -> Result<String> {
     })
 }
 
-fn confirm(question: &str, default: bool) -> Result<bool> {
-    let hint = if default { "[Y/n]" } else { "[y/N]" };
+fn choose_autosync(default: Autosync) -> Result<Autosync> {
+    let question = format!(
+        "Autosync: full (pull before editing, push after), \
+         save (sync after saving), off (use `{APP_NAME} sync`)"
+    );
     loop {
-        match read_answer(&format!("{question} {hint}"))?
-            .to_lowercase()
-            .as_str()
-        {
-            "" => return Ok(default),
-            "y" | "yes" => return Ok(true),
-            "n" | "no" => return Ok(false),
-            _ => eprintln!("Please answer y or n."),
+        match Autosync::from_name(&prompt(&question, default.as_str())?) {
+            Some(mode) => return Ok(mode),
+            None => eprintln!("Please answer {}.", Autosync::names()),
         }
     }
 }
