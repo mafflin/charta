@@ -1,9 +1,9 @@
 # charta
 
-Quick notes from the terminal, kept in a git repo.
+A tiny, lightweight CLI for quick notes, kept in a git repo.
 
 ```sh
-charta                 # new note named after the current directory
+charta                 # new note named <dir>-YYYY-MM-DD-HHMM
 charta new <name>      # new note with a given name (may contain `/`)
 charta open <name>     # open an existing note (tab-completed)
 charta list            # list notes
@@ -15,8 +15,8 @@ Notes are markdown files in `~/.local/share/charta/notes` (a git repo), opened
 in `$VISUAL` / `$EDITOR` / `vi`. A note saved empty (or whitespace-only) is
 deleted when the editor exits. Every change is committed.
 
-Running `charta` in a directory that already has a note creates
-`<dir>-YYYY-MM-DD-HHMM.md` instead.
+`<dir>` is the current directory's name. A second note from the same directory
+in the same minute gets a `-2` suffix, and so on.
 
 ## Install
 

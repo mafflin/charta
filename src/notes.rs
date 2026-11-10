@@ -43,7 +43,7 @@ pub fn exists(notes_dir: &Path, name: &str) -> bool {
 }
 
 /// Name for a note created without an explicit name: the current directory's
-/// name, with a timestamp appended if that note already exists.
+/// name with a timestamp appended, plus a counter if that note already exists.
 pub fn default_name(notes_dir: &Path, cwd: &Path, now: NaiveDateTime) -> String {
     let base = cwd
         .file_name()
@@ -53,9 +53,6 @@ pub fn default_name(notes_dir: &Path, cwd: &Path, now: NaiveDateTime) -> String 
         })
         .filter(|n| !n.is_empty())
         .unwrap_or_else(|| FALLBACK_NAME.to_string());
-    if !exists(notes_dir, &base) {
-        return base;
-    }
     let stamped = format!("{base}-{}", now.format(TIMESTAMP_FORMAT));
     if !exists(notes_dir, &stamped) {
         return stamped;
@@ -160,11 +157,9 @@ mod tests {
     }
 
     #[test]
-    fn default_name_uses_dir_then_timestamp_then_counter() {
+    fn default_name_uses_dir_and_timestamp_then_counter() {
         let dir = tempfile::tempdir().unwrap();
         let cwd = Path::new("/home/me/api");
-        assert_eq!(default_name(dir.path(), cwd, now()), "api");
-        touch(dir.path(), "api");
         assert_eq!(default_name(dir.path(), cwd, now()), "api-2026-11-10-1432");
         touch(dir.path(), "api-2026-11-10-1432");
         assert_eq!(
@@ -178,17 +173,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(
             default_name(dir.path(), Path::new("/home/me/.config"), now()),
-            "config"
+            "config-2026-11-10-1432"
         );
-        assert_eq!(default_name(dir.path(), Path::new("/"), now()), "note");
+        assert_eq!(
+            default_name(dir.path(), Path::new("/"), now()),
+            "note-2026-11-10-1432"
+        );
     }
 
     #[test]
-    fn default_name_strips_extension_so_note_can_be_opened() {
+    fn default_name_strips_extension_from_dir_name() {
         let dir = tempfile::tempdir().unwrap();
         let name = default_name(dir.path(), Path::new("/home/me/readme.md"), now());
-        assert_eq!(name, "readme");
-        assert_eq!(normalize(&format!("{name}.{EXT}")).unwrap(), name);
+        assert_eq!(name, "readme-2026-11-10-1432");
     }
 
     #[test]

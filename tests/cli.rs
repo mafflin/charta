@@ -75,9 +75,38 @@ impl Env {
         cmd
     }
 
+    /// Name (without extension) and content of the only note in the notes dir.
+    fn only_note(&self) -> (String, String) {
+        let mut notes: Vec<_> = fs::read_dir(self.notes())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().is_some_and(|e| e == "md"))
+            .collect();
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        let path = notes.pop().unwrap();
+        let name = path.file_stem().unwrap().to_string_lossy().into_owned();
+        (name, fs::read_to_string(path).unwrap())
+    }
+
     fn log(&self) -> String {
         git_out(&["log", "--format=%s"], &self.notes())
     }
+}
+
+/// Asserts `name` is `myproject-YYYY-MM-DD-HHMM`, plus `-N` if `counter`.
+fn assert_stamped(name: &str, counter: bool) {
+    let parts: Vec<_> = name.split('-').collect();
+    let lens: &[usize] = if counter {
+        &[9, 4, 2, 2, 4, 1]
+    } else {
+        &[9, 4, 2, 2, 4]
+    };
+    let ok = parts[0] == "myproject"
+        && parts.iter().map(|p| p.len()).eq(lens.iter().copied())
+        && parts[1..]
+            .iter()
+            .all(|p| p.bytes().all(|b| b.is_ascii_digit()));
+    assert!(ok, "unexpected default note name `{name}`");
 }
 
 fn charta_bin() -> PathBuf {
@@ -117,26 +146,27 @@ fn git_out(args: &[&str], dir: &Path) -> String {
 }
 
 #[test]
-fn no_args_creates_note_named_after_cwd_and_commits() {
+fn no_args_creates_note_named_after_cwd_and_time_and_commits() {
     let env = Env::new();
     env.cmd(Some("hello")).assert().success();
-    assert_eq!(
-        fs::read_to_string(env.notes().join("myproject.md")).unwrap(),
-        "hello"
-    );
-    assert_eq!(env.log(), "myproject: create\n");
+    let (name, content) = env.only_note();
+    assert_stamped(&name, false);
+    assert_eq!(content, "hello");
+    assert_eq!(env.log(), format!("{name}: create\n"));
 }
 
 #[test]
-fn second_note_from_same_dir_gets_timestamp() {
+fn second_note_from_same_dir_gets_distinct_name() {
     let env = Env::new();
     env.cmd(Some("one")).assert().success();
     env.cmd(Some("two")).assert().success();
     let names = String::from_utf8(env.cmd(None).arg("list").output().unwrap().stdout).unwrap();
     let names: Vec<_> = names.lines().collect();
     assert_eq!(names.len(), 2);
-    assert_eq!(names[0], "myproject");
-    assert!(names[1].starts_with("myproject-20"), "{names:?}");
+    assert_stamped(names[0], false);
+    // Same minute: the second note gets a counter. Otherwise: a new timestamp.
+    assert_stamped(names[1], names[1].starts_with(&format!("{}-", names[0])));
+    assert_ne!(names[0], names[1]);
 }
 
 #[test]
@@ -256,10 +286,9 @@ fn no_args_without_config_runs_init_first() {
         .write_stdin(format!("{notes}\n\n"))
         .assert()
         .success();
-    assert_eq!(
-        fs::read_to_string(env.notes().join("myproject.md")).unwrap(),
-        "hi"
-    );
+    let (name, content) = env.only_note();
+    assert_stamped(&name, false);
+    assert_eq!(content, "hi");
 }
 
 #[test]

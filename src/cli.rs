@@ -2,9 +2,10 @@ use clap::{Parser, Subcommand};
 
 use crate::config::APP_NAME;
 
-/// Quick notes from the terminal, kept in a git repo.
+/// A tiny, lightweight CLI for quick notes, kept in a git repo.
 ///
-/// Without a command, creates a new note named after the current directory.
+/// Without a command, creates a new note named after the current directory
+/// and the current time.
 #[derive(Parser)]
 #[command(name = APP_NAME, version)]
 pub struct Cli {
