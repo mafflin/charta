@@ -1,0 +1,29 @@
+#compdef charta
+
+# Zsh completion for charta: the command, then note names after open
+local -a commands notes
+commands=(
+    'init:set up charta: notes repo, autosync, notes directory'
+    'new:create a new note with the given name'
+    'open:open an existing note'
+    'list:list all notes'
+    'help:print help'
+)
+if (( CURRENT == 2 )); then
+    _describe 'command' commands
+elif (( CURRENT == 3 )); then
+    case $words[2] in
+        open)
+            notes=(${(f)"$(charta list 2>/dev/null)"})
+            compadd -a notes
+            ;;
+        help)
+            _describe 'command' commands
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+else
+    return 1
+fi
