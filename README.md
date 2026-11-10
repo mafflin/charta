@@ -61,3 +61,11 @@ can resolve things by hand.
 `charta init` checks that the remote is reachable before changing anything, and
 fails otherwise. Re-running it offers the current settings as defaults. Answer `-`
 at the remote prompt to switch back to local-only notes.
+
+## Development
+
+`rake` runs `cargo fmt --check`, `cargo test` and clippy.
+
+`rake dist` builds this platform's release binaries into `dist/`: static
+`charta-linux-x86_64` and `charta-linux-arm64` on Linux (needs `zig` and
+`cargo-zigbuild`), a universal `charta-macos` on a Mac.
