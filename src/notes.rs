@@ -44,6 +44,10 @@ pub fn exists(notes_dir: &Path, name: &str) -> bool {
 
 /// Name for a note created without an explicit name: the current directory's
 /// name with a timestamp appended, plus a counter if that note already exists.
+#[expect(
+    clippy::maybe_infinite_iter,
+    reason = "ends at the first free name; there are finitely many notes"
+)]
 pub fn default_name(notes_dir: &Path, cwd: &Path, now: NaiveDateTime) -> String {
     let base = cwd
         .file_name()
@@ -76,32 +80,44 @@ pub fn list(notes_dir: &Path) -> Result<Vec<String>> {
 fn collect(root: &Path, dir: &Path, names: &mut Vec<String>) -> Result<()> {
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
-        if entry
-            .file_name()
-            .to_string_lossy()
-            .starts_with(HIDDEN_PREFIX)
-        {
-            continue;
-        }
         let path = entry.path();
         if entry.file_type()?.is_dir() {
-            collect(root, &path, names)?;
-        } else if path.extension().is_some_and(|e| e == EXT) {
-            let rel = path.strip_prefix(root)?.with_extension("");
-            let parts: Vec<_> = rel
-                .components()
-                .map(|c| c.as_os_str().to_string_lossy())
-                .collect();
-            let name = parts.join(NAME_SEPARATOR);
-            // `x.md.md` is listed as is: `normalize` strips only one extension.
-            if strip_ext(&name) == name {
-                names.push(name);
-            } else {
-                names.push(format!("{name}{EXT_SEPARATOR}{EXT}"));
+            if !is_hidden(&entry.file_name().to_string_lossy()) {
+                collect(root, &path, names)?;
             }
+        } else if let Some(name) = name_of(path.strip_prefix(root)?) {
+            names.push(name);
         }
     }
     Ok(())
+}
+
+/// The name of the note at `rel` (relative to the notes dir), or `None` if
+/// it isn't one: not an [`EXT`] file, or hidden somewhere along the path.
+/// The name round-trips through [`normalize`].
+pub fn name_of(rel: &Path) -> Option<String> {
+    if rel.extension().is_none_or(|e| e != EXT) {
+        return None;
+    }
+    let parts: Vec<_> = rel
+        .with_extension("")
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    if parts.iter().any(|p| p.is_empty() || is_hidden(p)) {
+        return None;
+    }
+    let name = parts.join(NAME_SEPARATOR);
+    // `x.md.md` keeps one extension: `normalize` strips only one.
+    if strip_ext(&name) == name {
+        Some(name)
+    } else {
+        Some(format!("{name}{EXT_SEPARATOR}{EXT}"))
+    }
+}
+
+fn is_hidden(name: &str) -> bool {
+    name.starts_with(HIDDEN_PREFIX)
 }
 
 /// A note counts as empty if it contains only whitespace.
@@ -197,6 +213,15 @@ mod tests {
         fs::write(dir.path().join(".git/x.md"), "").unwrap();
         fs::write(dir.path().join("readme.txt"), "").unwrap();
         assert_eq!(list(dir.path()).unwrap(), vec!["a/c", "b"]);
+    }
+
+    #[test]
+    fn name_of_accepts_only_visible_notes() {
+        assert_eq!(name_of(Path::new("a/b.md")).as_deref(), Some("a/b"));
+        assert_eq!(name_of(Path::new("x.md.md")).as_deref(), Some("x.md.md"));
+        for not_a_note in ["readme.txt", "a/.b.md", ".git/x.md", "noext", "./a.md"] {
+            assert_eq!(name_of(Path::new(not_a_note)), None, "{not_a_note}");
+        }
     }
 
     #[test]

@@ -1,6 +1,6 @@
 [package]
 name = "charta"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
 
 [dependencies]
@@ -15,6 +15,9 @@ toml = "1.2.1"
 assert_cmd = "2.2.2"
 predicates = "3.1.4"
 tempfile = "3.27.0"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
 
 [profile.release]
 strip = true

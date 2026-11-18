@@ -1,17 +1,24 @@
-use std::path::Path;
+use std::ffi::OsStr;
+use std::io::{self, Write};
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::thread;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
-use crate::config::APP_NAME;
+use crate::sync;
 
 const GIT: &str = "git";
 pub const GIT_DIR: &str = ".git";
 pub const DEFAULT_REMOTE: &str = "origin";
 const UPSTREAM_REF: &str = "@{upstream}";
 const HEAD: &str = "HEAD";
-const COMMITTED_LOCALLY: &str = "changes are committed locally";
-const KEEPING_LOCAL: &str = "continuing with local notes";
+/// What git says when another git process holds the index.
+const INDEX_LOCKED: &str = "index.lock";
+const LOCK_RETRIES: u32 = 20;
+const LOCK_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 /// What happened to a note, as recorded in its commit message.
 enum NoteChange {
@@ -57,10 +64,39 @@ fn run(cmd: &mut Command) -> Result<()> {
     Ok(())
 }
 
+/// Like [`run`], but retries for a while if another git process (e.g. one
+/// the user runs by hand) holds the index lock.
+fn run_retrying(cmd: &mut Command) -> Result<()> {
+    let mut attempt = 1;
+    loop {
+        let out = cmd.output().with_context(spawn_error)?;
+        if out.status.success() {
+            return Ok(());
+        }
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if attempt < LOCK_RETRIES && stderr.contains(INDEX_LOCKED) {
+            attempt += 1;
+            thread::sleep(LOCK_RETRY_DELAY);
+            continue;
+        }
+        // Hooks may report on either.
+        let _ = io::stdout().write_all(&out.stdout);
+        let _ = io::stderr().write_all(&out.stderr);
+        bail!("`{}` failed", describe(cmd));
+    }
+}
+
 /// Runs the command with stderr silenced and returns its stdout, minus the
 /// trailing newline. Leading whitespace is kept (it's significant in
 /// `git status --porcelain`).
 fn output(cmd: &mut Command) -> Result<String> {
+    let stdout = output_bytes(cmd)?;
+    Ok(String::from_utf8_lossy(&stdout).trim_end().to_string())
+}
+
+/// Like [`output`], but returns stdout as it is, for paths that may not be
+/// UTF-8.
+fn output_bytes(cmd: &mut Command) -> Result<Vec<u8>> {
     let out = cmd
         .stderr(Stdio::null())
         .output()
@@ -68,7 +104,7 @@ fn output(cmd: &mut Command) -> Result<String> {
     if !out.status.success() {
         bail!("`{}` failed", describe(cmd));
     }
-    Ok(String::from_utf8_lossy(&out.stdout).trim_end().to_string())
+    Ok(out.stdout)
 }
 
 fn succeeds(cmd: &mut Command) -> bool {
@@ -81,13 +117,6 @@ fn succeeds(cmd: &mut Command) -> bool {
 fn describe(cmd: &Command) -> String {
     let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy()).collect();
     format!("{GIT} {}", args.join(" "))
-}
-
-/// Reports a failed sync step as a warning, with what it means for the notes.
-fn warn_on_err(result: Result<()>, consequence: &str) {
-    if let Err(err) = result {
-        eprintln!("{APP_NAME}: warning: {err:#}, {consequence}");
-    }
 }
 
 pub fn is_repo(dir: &Path) -> bool {
@@ -151,7 +180,7 @@ pub fn connect_remote(dir: &Path, url: &str) -> Result<()> {
     // Pruning drops refs of a previous remote, so they don't count as upstream.
     fetch(dir)?;
     track(dir)?;
-    warn_on_err(integrate(dir), KEEPING_LOCAL);
+    sync::warn_on_err(integrate(dir), sync::KEEPING_LOCAL);
     Ok(())
 }
 
@@ -196,7 +225,7 @@ fn remote_default_branch(dir: &Path) -> Option<String> {
 
 /// Fetches the remote, starts tracking it if it has history now (it may have
 /// been empty at `init`), and rebases local commits onto it.
-fn try_pull(dir: &Path) -> Result<()> {
+pub fn pull(dir: &Path) -> Result<()> {
     if !has_remote(dir) {
         return Ok(());
     }
@@ -242,15 +271,9 @@ fn has_uncommitted_changes(dir: &Path) -> Result<bool> {
     Ok(!status.is_empty())
 }
 
-/// [`try_pull`], with failures only as warnings: being offline must never
-/// stop you from taking a note.
-pub fn pull(dir: &Path) {
-    warn_on_err(try_pull(dir), KEEPING_LOCAL);
-}
-
 /// Pushes local commits the upstream doesn't have, setting the upstream to
 /// [`DEFAULT_REMOTE`] on first push.
-fn try_push(dir: &Path) -> Result<()> {
+pub fn push(dir: &Path) -> Result<()> {
     if has_upstream(dir) {
         if is_ahead(dir) {
             run(git(dir).args(["push", "-q"]))?;
@@ -261,21 +284,26 @@ fn try_push(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// [`try_push`], with failures only as warnings; commits stay local until
-/// the next successful push.
-pub fn push(dir: &Path) {
-    warn_on_err(try_push(dir), COMMITTED_LOCALLY);
-}
-
-/// Pulls, then pushes local commits.
-pub fn sync(dir: &Path) -> Result<()> {
-    try_pull(dir)?;
-    try_push(dir)
-}
-
-/// [`sync`], with failures only as warnings.
-pub fn sync_or_warn(dir: &Path) {
-    warn_on_err(sync(dir), COMMITTED_LOCALLY);
+/// Files that differ from the last commit, untracked ones included,
+/// relative to `dir`. Renames and copies the user staged are left out.
+pub fn changed_files(dir: &Path) -> Result<Vec<PathBuf>> {
+    // `-z`: unquoted paths, NUL-terminated, kept as bytes (they may not be UTF-8).
+    let status =
+        output_bytes(git(dir).args(["status", "--porcelain", "-z", "--untracked-files=all"]))?;
+    let mut files = Vec::new();
+    let mut entries = status.split(|&b| b == 0).filter(|e| !e.is_empty());
+    while let Some(entry) = entries.next() {
+        let (Some(code), Some(path)) = (entry.get(..2), entry.get(3..)) else {
+            continue;
+        };
+        if code.iter().any(|c| matches!(c, b'R' | b'C')) {
+            // The next entry is the source path.
+            entries.next();
+            continue;
+        }
+        files.push(PathBuf::from(OsStr::from_bytes(path)));
+    }
+    Ok(files)
 }
 
 /// Commits the current state of a single note, if it changed.
@@ -290,7 +318,7 @@ pub fn commit_note(dir: &Path, rel: &Path, name: &str) -> Result<bool> {
         return Ok(false);
     };
     let change = NoteChange::from_porcelain(code);
-    run(git(dir).args(["add", "-A", "--"]).arg(rel))?;
+    run_retrying(git(dir).args(["add", "-A", "--"]).arg(rel))?;
     // Staging can leave nothing to commit, e.g. a note that was added to the
     // index but never committed, then emptied.
     if succeeds(
@@ -301,9 +329,11 @@ pub fn commit_note(dir: &Path, rel: &Path, name: &str) -> Result<bool> {
         return Ok(false);
     }
     let message = format!("{name}: {}", change.as_str());
-    run(git(dir)
-        .args(["commit", "-q", "-m", &message, "--"])
-        .arg(rel))
+    run_retrying(
+        git(dir)
+            .args(["commit", "-q", "-m", &message, "--"])
+            .arg(rel),
+    )
     .context("note is saved, but committing it failed")?;
     Ok(true)
 }

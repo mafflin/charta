@@ -2,12 +2,18 @@ use clap::{Parser, Subcommand};
 
 use crate::config::APP_NAME;
 
+const EXIT_STATUS: &str = "\
+Exit status:
+  0    success
+  1    error
+  2    invalid command line";
+
 /// A tiny, lightweight CLI for quick notes, kept in a git repo.
 ///
 /// Without a command, creates a new note named after the current directory
 /// and the current time.
 #[derive(Parser)]
-#[command(name = APP_NAME, version)]
+#[command(name = APP_NAME, version, after_help = EXIT_STATUS)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Command>,

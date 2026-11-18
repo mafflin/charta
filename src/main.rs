@@ -4,6 +4,7 @@ mod editor;
 mod git;
 mod init;
 mod notes;
+mod sync;
 
 use std::env;
 use std::path::{Path, PathBuf};
@@ -71,7 +72,7 @@ fn run() -> Result<()> {
             if !git::has_remote(&dir) {
                 bail!("the notes repo has no remote, run `{APP_NAME} init`");
             }
-            git::sync(&dir)
+            sync::sync(&dir)
         }
     }
 }
@@ -79,16 +80,15 @@ fn run() -> Result<()> {
 /// Loads the config (running `init` if there is none), finds the notes repo
 /// and, with `full` autosync, pulls.
 fn setup() -> Result<(Config, PathBuf)> {
-    let config = match Config::load()? {
-        Some(config) => config,
-        None => {
-            eprintln!("{APP_NAME} is not set up yet, let's do that first.\n");
-            init::run(None)?
-        }
+    let config = if let Some(config) = Config::load()? {
+        config
+    } else {
+        eprintln!("{APP_NAME} is not set up yet, let's do that first.\n");
+        init::run(None)?
     };
     let dir = repo_dir(&config)?;
     if config.sync_mode() == Autosync::Full {
-        git::pull(&dir);
+        sync::pull(&dir);
     }
     Ok((config, dir))
 }
@@ -136,11 +136,10 @@ fn edit(config: &Config, dir: &Path, name: &str) -> Result<()> {
     }
     match config.sync_mode() {
         Autosync::Off => {}
-        // Already pulled before editing.
-        Autosync::Full => git::push(dir),
-        Autosync::Save if committed => git::sync_or_warn(dir),
-        // Nothing changed: just retry a push that failed earlier, if any.
-        Autosync::Save => git::push(dir),
+        Autosync::Save if committed => sync::sync_or_warn(dir),
+        // Full already pulled before editing. Save without a change just
+        // retries a push that failed earlier, if any.
+        Autosync::Full | Autosync::Save => sync::push(dir),
     }
     edited
 }

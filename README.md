@@ -55,12 +55,19 @@ Local-only notes (no `repo`) never sync, whatever `autosync` says.
 
 Autosync failures (e.g. offline) are warnings; notes are always saved and committed locally.
 `charta sync` reports them as errors instead. A pull never leaves the repo half-done: one
-that conflicts is aborted, and none starts while the repo has uncommitted changes, so you
-can resolve things by hand.
+that conflicts is aborted, so you can resolve things by hand. Before pulling, charta commits
+notes that were left uncommitted (e.g. after a crash); other uncommitted files stop the pull.
+
+A note that's open in another editor (or another charta run) when charta commits stray notes
+may be committed half-done; saving it later just adds another commit.
 
 `charta init` checks that the remote is reachable before changing anything, and
 fails otherwise. Re-running it offers the current settings as defaults. Answer `-`
 at the remote prompt to switch back to local-only notes.
+
+## Exit status
+
+`0` success, `1` error, `2` invalid command line.
 
 ## Development
 

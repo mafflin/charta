@@ -1029,15 +1029,43 @@ fn sync_brings_remote_history_into_clone_without_commits() {
 }
 
 #[test]
-fn sync_refuses_to_pull_over_uncommitted_changes() {
+fn sync_commits_stray_notes_before_pulling() {
     let env = Env::bare();
     let remote = bare_remote(&env);
     init_without_autosync(&env, &remote);
     env.cmd(Some("v1")).args(["new", "a"]).assert().success();
     env.cmd(None).arg("sync").assert().success();
     push_from_elsewhere(&env, &remote, "b.md", "theirs");
-    // Edited outside charta, never committed.
+    // Left uncommitted, like after a crash or a failed commit.
     fs::write(env.notes().join("a.md"), "uncommitted").unwrap();
+    fs::create_dir_all(env.notes().join("dir")).unwrap();
+    fs::write(env.notes().join("dir/c.md"), "new").unwrap();
+    fs::write(env.notes().join("empty.md"), " \n").unwrap();
+
+    env.cmd(None).arg("sync").assert().success();
+    assert_eq!(
+        fs::read_to_string(env.notes().join("a.md")).unwrap(),
+        "uncommitted"
+    );
+    assert!(env.notes().join("b.md").exists());
+    assert!(!env.notes().join("empty.md").exists());
+    let pushed = git_out(&["log", "--format=%s", "HEAD"], &remote);
+    let mut stray_commits: Vec<_> = pushed.lines().take(2).collect();
+    stray_commits.sort_unstable();
+    assert_eq!(stray_commits, ["a: update", "dir/c: create"], "{pushed}");
+}
+
+#[test]
+fn sync_refuses_to_pull_over_uncommitted_files_that_are_not_notes() {
+    let env = Env::bare();
+    let remote = bare_remote(&env);
+    init_without_autosync(&env, &remote);
+    fs::write(env.notes().join("readme.txt"), "v1").unwrap();
+    git(&["add", "readme.txt"], &env.notes());
+    git(&["commit", "-q", "-m", "readme"], &env.notes());
+    env.cmd(None).arg("sync").assert().success();
+    push_from_elsewhere(&env, &remote, "b.md", "theirs");
+    fs::write(env.notes().join("readme.txt"), "uncommitted").unwrap();
 
     env.cmd(None)
         .arg("sync")
@@ -1045,11 +1073,81 @@ fn sync_refuses_to_pull_over_uncommitted_changes() {
         .failure()
         .stderr(predicate::str::contains("uncommitted changes"));
     assert_eq!(
-        fs::read_to_string(env.notes().join("a.md")).unwrap(),
+        fs::read_to_string(env.notes().join("readme.txt")).unwrap(),
         "uncommitted"
     );
     assert!(!env.notes().join("b.md").exists());
+    assert_eq!(env.log(), "readme\n");
+}
+
+#[test]
+fn stray_notes_that_are_not_utf8_are_committed() {
+    use std::os::unix::ffi::OsStrExt;
+    let env = Env::bare();
+    let remote = bare_remote(&env);
+    init_without_autosync(&env, &remote);
+    let name = std::ffi::OsStr::from_bytes(b"caf\xe9.md");
+    fs::write(env.notes().join(name), "stray").unwrap();
+
+    env.cmd(None).arg("sync").assert().success();
+    assert_eq!(git_out(&["status", "--porcelain"], &env.notes()), "");
+    assert_eq!(commit_count(&remote), "1\n");
+}
+
+#[test]
+fn failed_stray_commit_still_pushes_the_note_that_was_saved() {
+    use std::os::unix::fs::PermissionsExt;
+    let env = Env::bare();
+    let remote = bare_remote(&env);
+    init_with_remote(&env, &remote);
+    let hook = env.notes().join(".git/hooks/pre-commit");
+    fs::create_dir_all(hook.parent().unwrap()).unwrap();
+    fs::write(
+        &hook,
+        "#!/bin/sh\ngit diff --cached --name-only | grep -q bad && exit 1\nexit 0\n",
+    )
+    .unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::write(env.notes().join("bad.md"), "stray").unwrap();
+
+    env.cmd(Some("mine"))
+        .args(["new", "c"])
+        .assert()
+        .success()
+        .stderr(
+            predicate::str::contains("committing it failed")
+                .and(predicate::str::contains("committed locally").not()),
+        );
+    assert_eq!(
+        git_out(&["log", "--format=%s", "HEAD"], &remote),
+        "c: create\n"
+    );
+}
+#[test]
+fn commit_waits_for_a_locked_index() {
+    let env = Env::new();
+    let index_lock = env.notes().join(".git/index.lock");
+    fs::write(&index_lock, "").unwrap();
+    // Well within the ~2 s charta keeps retrying.
+    let unlock = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        fs::remove_file(index_lock).unwrap();
+    });
+    env.cmd(Some("x")).args(["new", "a"]).assert().success();
+    unlock.join().unwrap();
     assert_eq!(env.log(), "a: create\n");
+}
+
+#[test]
+fn help_documents_exit_status() {
+    Command::cargo_bin("charta")
+        .unwrap()
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("Exit status:").and(predicate::str::contains("2    invalid")),
+        );
 }
 
 #[test]
